@@ -13,21 +13,23 @@ def read_xyz_file(filename):
     with open(filename, 'r') as f:
         lines = f.readlines()
     
-    # Skip the first two lines (atom count and comment)
+    # Get atom count from first line
+    atom_count = int(lines[0].strip())
+    
+    # Parse atoms
     atoms = []
-    for line in lines[2:]:
+    for line in lines[2:2+atom_count]:
         parts = line.strip().split()
         if len(parts) >= 4:
             element = parts[0]
             x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
             atoms.append((element, np.array([x, y, z])))
     
-    print(atoms)
     # Separate C and H atoms
-    c_atoms = [atom[1] for atom in atoms if atom[0] == '6']
-    h_atoms = [atom[1] for atom in atoms if atom[0] == '1']
+    c_atoms = [atom[1] for atom in atoms if atom[0] == '6' or atom[0] == 'C']
+    h_atoms = [atom[1] for atom in atoms if atom[0] == '1' or atom[0] == 'H']
     
-    return np.array(c_atoms), np.array(h_atoms)
+    return np.array(c_atoms) if c_atoms else np.empty((0,3)), np.array(h_atoms) if h_atoms else np.empty((0,3))
 
 #
 # Read VTK file to get grid points and magnetic field vectors
@@ -107,11 +109,11 @@ def write_vtk_file(filename, grid_points, vectors, dims):
         f.write(f"DIMENSIONS {dims[0]} {dims[1]} {dims[2]}\n")
         f.write(f"POINTS {len(grid_points)} float\n")
         for pt in grid_points:
-            f.write(f"    {pt[0]: .3f} {pt[1]: .3f} {pt[2]: .3f}\n")
+            f.write(f"    {pt[0]: .6f} {pt[1]: .6f} {pt[2]: .6f}\n")
         f.write(f"\nPOINT_DATA {len(vectors)}\n")
         f.write("VECTORS point_vectors float\n")
         for v in vectors:
-            f.write(f"    {v[0]: .3f} {v[1]: .3f} {v[2]: .3f}\n")
+            f.write(f"    {v[0]: .6f} {v[1]: .6f} {v[2]: .6f}\n")
 
 #
 # RBF layer for distance expansion
@@ -122,7 +124,8 @@ class RBF(nn.Module):
         self.num_centers = num_centers
         centers = torch.linspace(0.0, cutoff, num_centers)
         self.register_buffer('centers', centers)
-        self.gamma = nn.Parameter(torch.tensor(10.0), requires_grad=False)
+        # Make gamma learnable
+        self.gamma = nn.Parameter(torch.tensor(10.0))
 
     def forward(self, d):
         # d: (...,) distances
@@ -132,151 +135,313 @@ class RBF(nn.Module):
         return torch.exp(-self.gamma * (diff ** 2))  # (..., C)
 
 
-class AtomQueryFieldNet(nn.Module):
+class PaddedAtomQueryFieldNet(nn.Module):
     """
-    Simple equivariant-inspired model:
-      - For each query point q and atom a compute vector r = q - r_a
-      - Use radial basis expansion of |r| and atom scalar features to produce a scalar weight w(q,a)
-      - Contribution to B at q from atom a is w(q,a) * (r / |r|)
-      - Sum contributions over atoms and pass through small MLP
-    This produces outputs that rotate with coordinates (constructed from r vectors).
+    Fixed-size network with padding for variable number of atoms.
+    Maximum atoms = 40 (based on requirement)
     """
-    def __init__(self, atom_feat_dim=2, rbf_centers=16, hidden=64, cutoff=6.0):
+    def __init__(self, max_atoms=40, atom_feat_dim=2, rbf_centers=32, hidden=128, cutoff=8.0):
         super().__init__()
+        self.max_atoms = max_atoms
+        self.cutoff = cutoff
+        
         self.rbf = RBF(num_centers=rbf_centers, cutoff=cutoff)
+        
+        # Process each atom independently
         self.atom_mlp = nn.Sequential(
             nn.Linear(atom_feat_dim + rbf_centers, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU()
         )
-        # scalar weight -> multiply unit vector
+        
+        # Scalar weight output
         self.scalar_out = nn.Sequential(
             nn.Linear(hidden, hidden//2),
             nn.ReLU(),
             nn.Linear(hidden//2, 1)
         )
-        # final small projection on aggregated vector
+        
+        # Final projection
         self.final_proj = nn.Sequential(
             nn.Linear(3, 64),
             nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
             nn.Linear(64, 3)
         )
-        self.cutoff = cutoff
+        
+        # Learnable embedding for padding atoms (will be ignored via mask)
+        self.register_buffer('padding_feat', torch.zeros(1, atom_feat_dim))
 
-    def forward(self, atom_pos, atom_feat, query_pos):
+    def forward(self, atom_pos, atom_feat, query_pos, atom_mask):
         """
-        atom_pos: (Na,3) tensor
-        atom_feat: (Na, F) tensor (scalar features per atom)
-        query_pos: (Nq,3) tensor
-        returns: preds (Nq,3)
+        atom_pos: (max_atoms, 3) - padded atom positions
+        atom_feat: (max_atoms, F) - padded atom features
+        query_pos: (Nq, 3) - query points
+        atom_mask: (max_atoms,) - 1 for real atoms, 0 for padding
         """
-        # Expand to (Nq, Na, 3)
-        rel = query_pos.unsqueeze(1) - atom_pos.unsqueeze(0)  # (Nq,Na,3)
-        dist = torch.norm(rel + 1e-12, dim=-1)  # (Nq,Na)
-        # Mask atoms outside cutoff (optional)
-        mask = (dist <= self.cutoff).float()  # (Nq,Na)
-
+        # Expand dimensions for broadcasting
+        rel = query_pos.unsqueeze(1) - atom_pos.unsqueeze(0)  # (Nq, max_atoms, 3)
+        dist = torch.norm(rel + 1e-12, dim=-1)  # (Nq, max_atoms)
+        
+        # Create mask: real atoms within cutoff
+        cutoff_mask = (dist <= self.cutoff).float()  # (Nq, max_atoms)
+        mask = atom_mask.unsqueeze(0) * cutoff_mask  # (Nq, max_atoms)
+        
         # RBF embedding
-        rbf = self.rbf(dist)  # (Nq,Na,C)
-        # Prepare atom_feat broadcasted
-        atom_feat_b = atom_feat.unsqueeze(0).expand(query_pos.size(0), -1, -1)  # (Nq,Na,F)
-        atom_input = torch.cat([atom_feat_b, rbf], dim=-1)  # (Nq,Na,F+C)
-        # Pass through atom MLP -> per (q,a) embedding
-        h = self.atom_mlp(atom_input)  # (Nq,Na,H)
-        scalar_w = self.scalar_out(h).squeeze(-1)  # (Nq,Na)
-        scalar_w = scalar_w * mask  # zero out contributions from far atoms
-
+        rbf = self.rbf(dist)  # (Nq, max_atoms, C)
+        
+        # Broadcast atom features
+        atom_feat_b = atom_feat.unsqueeze(0).expand(query_pos.size(0), -1, -1)  # (Nq, max_atoms, F)
+        
+        # Concatenate and process
+        atom_input = torch.cat([atom_feat_b, rbf], dim=-1)  # (Nq, max_atoms, F+C)
+        h = self.atom_mlp(atom_input)  # (Nq, max_atoms, H)
+        scalar_w = self.scalar_out(h).squeeze(-1)  # (Nq, max_atoms)
+        
+        # Apply mask (zero out padding and atoms beyond cutoff)
+        scalar_w = scalar_w * mask
+        
         # Unit direction vectors
-        dir_vec = rel / (dist.unsqueeze(-1) + 1e-12)  # (Nq,Na,3)
-        # Weighted sum of directions
-        weighted = (scalar_w.unsqueeze(-1) * dir_vec).sum(dim=1)  # (Nq,3)
-        # Final small projection
-        out = self.final_proj(weighted)  # (Nq,3)
+        dir_vec = rel / (dist.unsqueeze(-1) + 1e-12)  # (Nq, max_atoms, 3)
+        
+        # Weighted sum (padded atoms contribute zero due to mask)
+        weighted = (scalar_w.unsqueeze(-1) * dir_vec).sum(dim=1)  # (Nq, 3)
+        
+        # Final projection
+        out = self.final_proj(weighted)  # (Nq, 3)
+        
         return out
 
 
-# ---- utility to build simple atom features (one-hot C/H) ----
-def atom_features_from_xyz(c_atoms, h_atoms):
+def atom_features_from_xyz(c_atoms, h_atoms, max_atoms=40):
     """
-    Returns:
-      atom_pos: (Na,3) numpy array
-      atom_feat: (Na,2) numpy array one-hot [is_C, is_H]
+    Returns padded atom positions and features.
+    Also returns mask indicating real atoms.
     """
     pos_list = []
     feats = []
+    
+    # Add Carbon atoms
     for p in c_atoms:
         pos_list.append(p)
-        feats.append([1.0, 0.0])
+        feats.append([1.0, 0.0])  # [is_C, is_H]
+    
+    # Add Hydrogen atoms
     for p in h_atoms:
         pos_list.append(p)
         feats.append([0.0, 1.0])
-    if len(pos_list) == 0:
-        return np.zeros((0,3)), np.zeros((0,2))
-    return np.vstack(pos_list), np.vstack(feats)
+    
+    n_atoms = len(pos_list)
+    if n_atoms == 0:
+        return np.zeros((max_atoms, 3)), np.zeros((max_atoms, 2)), np.zeros(max_atoms)
+    
+    # Convert to arrays
+    atom_pos = np.vstack(pos_list)
+    atom_feat = np.vstack(feats)
+    
+    # Create mask
+    mask = np.ones(max_atoms)
+    mask[n_atoms:] = 0
+    
+    # Pad to max_atoms
+    if n_atoms < max_atoms:
+        padded_pos = np.zeros((max_atoms, 3))
+        padded_feat = np.zeros((max_atoms, 2))
+        padded_pos[:n_atoms] = atom_pos
+        padded_feat[:n_atoms] = atom_feat
+    else:
+        # Truncate if more than max_atoms (shouldn't happen with max_atoms=40)
+        padded_pos = atom_pos[:max_atoms]
+        padded_feat = atom_feat[:max_atoms]
+        mask = np.ones(max_atoms)
+    
+    return padded_pos, padded_feat, mask
 
 
-# ---- Training / run script ----
-def main():
-    # Paths (edit if needed)
-    vtk_file = "../VTK/Tacne/benz_xy.vtk"
-    xyz_file = "../VTK/Tacne/benz.xyz"
-    out_vtk = "../VTK/Tacne/predicted_gnn.vtk"
-
-    # Read inputs using copied routines
-    print("Reading data...")
+def load_molecule_data(xyz_file, vtk_file, max_atoms=40):
+    """Load and prepare data for a single molecule"""
     c_atoms, h_atoms = read_xyz_file(xyz_file)
     grid_points, magnetic_vectors, dims = read_vtk_file(vtk_file)
+    
+    atom_pos_pad, atom_feat_pad, atom_mask = atom_features_from_xyz(c_atoms, h_atoms, max_atoms)
+    
+    return {
+        'atom_pos': atom_pos_pad,
+        'atom_feat': atom_feat_pad,
+        'atom_mask': atom_mask,
+        'query_pos': grid_points,
+        'target': magnetic_vectors,
+        'dims': dims,
+        'name': os.path.basename(xyz_file).replace('.xyz', '')
+    }
 
-    atom_pos_np, atom_feat_np = atom_features_from_xyz(c_atoms, h_atoms)
-    if atom_pos_np.size == 0:
-        raise RuntimeError("No atoms found from XYZ parser.")
 
-    # Convert to tensors
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    atom_pos = torch.tensor(atom_pos_np, dtype=torch.float32, device=device)
-    atom_feat = torch.tensor(atom_feat_np, dtype=torch.float32, device=device)
-    query_pos = torch.tensor(grid_points, dtype=torch.float32, device=device)
-    targets = torch.tensor(magnetic_vectors, dtype=torch.float32, device=device)
-
-    # Model
-    model = AtomQueryFieldNet(atom_feat_dim=atom_feat.shape[1], rbf_centers=32, hidden=128, cutoff=8.0)
-    model.to(device)
-
-    optim = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-6)
-    loss_fn = nn.MSELoss()
-
-    # Training loop (small number of epochs; increase if needed)
-    epochs = 1000
-    batch_query = query_pos  # we process all queries together (single molecule)
-    best_loss = 1e9
+def train_epoch(model, optimizer, molecule_data, device):
+    """Train for one epoch on a single molecule"""
     model.train()
-    for epoch in range(1, epochs + 1):
-        optim.zero_grad()
-        pred = model(atom_pos, atom_feat, batch_query)  # (Nq,3)
-        loss = loss_fn(pred, targets)
-        loss.backward()
-        optim.step()
+    
+    # Move data to device
+    atom_pos = torch.tensor(molecule_data['atom_pos'], dtype=torch.float32, device=device)
+    atom_feat = torch.tensor(molecule_data['atom_feat'], dtype=torch.float32, device=device)
+    atom_mask = torch.tensor(molecule_data['atom_mask'], dtype=torch.float32, device=device)
+    query_pos = torch.tensor(molecule_data['query_pos'], dtype=torch.float32, device=device)
+    targets = torch.tensor(molecule_data['target'], dtype=torch.float32, device=device)
+    
+    optimizer.zero_grad()
+    pred = model(atom_pos, atom_feat, query_pos, atom_mask)
+    loss = nn.MSELoss()(pred, targets)
+    loss.backward()
+    optimizer.step()
+    
+    return loss.item()
 
-        if epoch % 50 == 0 or epoch == 1:
-            print(f"Epoch {epoch:4d}  Loss: {loss.item():.6e}")
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            # optional: save best weights
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    # Load best (if saved)
-    model.load_state_dict(best_state)
+def evaluate(model, molecule_data, device):
+    """Evaluate on a molecule"""
     model.eval()
     
     with torch.no_grad():
-        pred_vecs = model(atom_pos, atom_feat, query_pos).cpu().numpy()
+        atom_pos = torch.tensor(molecule_data['atom_pos'], dtype=torch.float32, device=device)
+        atom_feat = torch.tensor(molecule_data['atom_feat'], dtype=torch.float32, device=device)
+        atom_mask = torch.tensor(molecule_data['atom_mask'], dtype=torch.float32, device=device)
+        query_pos = torch.tensor(molecule_data['query_pos'], dtype=torch.float32, device=device)
+        targets = torch.tensor(molecule_data['target'], dtype=torch.float32, device=device)
+        
+        pred = model(atom_pos, atom_feat, query_pos, atom_mask)
+        loss = nn.MSELoss()(pred, targets)
+        
+        return loss.item(), pred.cpu().numpy()
 
-    # Save predicted vectors to VTK using copied routine
-    write_vtk_file(out_vtk, grid_points, pred_vecs, dims)
-    print(f"Saved predicted field to: {out_vtk}")
-    # Also save numpy for inspection
-    np.savez('gnn_prediction.npz', grid=grid_points, target=magnetic_vectors, pred=pred_vecs)
+
+def main():
+    # Configuration
+    MAX_ATOMS = 40
+    RBF_CENTERS = 32
+    HIDDEN_SIZE = 128
+    CUTOFF = 8.0
+    EPOCHS = 2000
+    LEARNING_RATE = 1e-3
+    
+    # Data paths
+    base_path = "../VTK/Tacne"
+    train_molecules = [
+        #('benz.xyz', 'benz_xy.vtk'),
+        ('DBP.xyz', 'DBP_xy.vtk')
+    ]
+    #test_molecule = ('ZnPorf.xyz', 'ZnPorf_xy.vtk')
+    test_molecule = ('benz.xyz', 'benz_xy.vtk')
+    #test_molecule = ('DBP.xyz', 'DBP_xy.vtk')
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load training data
+    print("\nLoading training data...")
+    train_data = []
+    for xyz_file, vtk_file in train_molecules:
+        print(f"  Loading {xyz_file} and {vtk_file}")
+        data = load_molecule_data(
+            os.path.join(base_path, xyz_file),
+            os.path.join(base_path, vtk_file),
+            MAX_ATOMS
+        )
+        train_data.append(data)
+        print(f"    Atoms: {int(data['atom_mask'].sum())}")
+        print(f"    Query points: {len(data['query_pos'])}")
+    
+    # Load test data
+    print("\nLoading test data...")
+    test_data = load_molecule_data(
+        os.path.join(base_path, test_molecule[0]),
+        os.path.join(base_path, test_molecule[1]),
+        MAX_ATOMS
+    )
+    print(f"  {test_molecule[0]}: {int(test_data['atom_mask'].sum())} atoms")
+    print(f"  Query points: {len(test_data['query_pos'])}")
+    
+    # Create model
+    model = PaddedAtomQueryFieldNet(
+        max_atoms=MAX_ATOMS,
+        atom_feat_dim=2,
+        rbf_centers=RBF_CENTERS,
+        hidden=HIDDEN_SIZE,
+        cutoff=CUTOFF
+    ).to(device)
+    
+    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
+    
+    # Training loop
+    print("\nStarting training...")
+    best_test_loss = float('inf')
+    
+    for epoch in range(1, EPOCHS + 1):
+        # Train on each molecule
+        epoch_loss = 0
+        for mol_data in train_data:
+            loss = train_epoch(model, optimizer, mol_data, device)
+            epoch_loss += loss
+        
+        avg_train_loss = epoch_loss / len(train_data)
+        
+        # Evaluate on test set every 50 epochs
+        if epoch % 50 == 0 or epoch == 1:
+            test_loss, _ = evaluate(model, test_data, device)
+            
+            print(f"Epoch {epoch:4d} | Train Loss: {avg_train_loss:.6e} | Test Loss: {test_loss:.6e}")
+            
+            # Save best model
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss
+                torch.save(model.state_dict(), 'best_padded_model.pth')
+                print(f"  → New best model saved! (Test loss: {test_loss:.6e})")
+            
+            # Learning rate scheduling
+            scheduler.step(test_loss)
+    
+    # Load best model and evaluate thoroughly
+    print(f"\nBest test loss: {best_test_loss:.6e}")
+    model.load_state_dict(torch.load('best_padded_model.pth'))
+    
+    # Final evaluation on all molecules
+    print("\nFinal Evaluation:")
+    print("-" * 50)
+    
+    for i, mol_data in enumerate(train_data):
+        loss, pred = evaluate(model, mol_data, device)
+        print(f"Train - {mol_data['name']}: MSE = {loss:.6e}")
+        
+        # Save predictions for training molecules
+        out_vtk = os.path.join(base_path, f"pred_{mol_data['name']}.vtk")
+        write_vtk_file(out_vtk, mol_data['query_pos'], pred, mol_data['dims'])
+        print(f"  Saved: {out_vtk}")
+    
+    # Test molecule
+    test_loss, test_pred = evaluate(model, test_data, device)
+    print(f"Test  - {test_data['name']}: MSE = {test_loss:.6e}")
+    
+    # Save test predictions
+    out_vtk = os.path.join(base_path, f"pred_{test_data['name']}.vtk")
+    write_vtk_file(out_vtk, test_data['query_pos'], test_pred, test_data['dims'])
+    print(f"Saved: {out_vtk}")
+    
+    # Save all predictions as numpy for analysis
+    np.savez('all_predictions.npz',
+             #train_benz_pred=evaluate(model, train_data[0], device)[1],
+             train_dbp_pred=evaluate(model, train_data[0], device)[1],
+             #test_znporf_pred=test_pred
+             #test_dpb_pred=test_pred)
+             test_benz_pred=test_pred)
+
 
 if __name__ == "__main__":
     main()
+
