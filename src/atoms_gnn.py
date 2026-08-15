@@ -224,41 +224,88 @@ def atom_features_from_xyz(c_atoms, h_atoms, max_atoms=40):
     """
     pos_list = []
     feats = []
-    
+
     # Add Carbon atoms
     for p in c_atoms:
         pos_list.append(p)
         feats.append([1.0, 0.0])  # [is_C, is_H]
-    
+
     # Add Hydrogen atoms
     for p in h_atoms:
         pos_list.append(p)
         feats.append([0.0, 1.0])
-    
+
     n_atoms = len(pos_list)
     if n_atoms == 0:
-        return np.zeros((max_atoms, 3)), np.zeros((max_atoms, 2)), np.zeros(max_atoms)
-    
+        return np.zeros((max_atoms, 3)), np.zeros((max_atoms, 8)), np.zeros(max_atoms)
+
     # Convert to arrays
     atom_pos = np.vstack(pos_list)
     atom_feat = np.vstack(feats)
     
+    # Track atom types for C/H neighbor counts
+    atom_type = np.zeros(n_atoms, dtype=int)
+    atom_type[:len(c_atoms)] = 1  # 1 for C
+    # H atoms are index len(c_atoms) onward, type 0 -> will count H separately
+
+    # Build KDTree and compute simple per-atom neighbor stats
+    tree = KDTree(atom_pos)
+    bond_cutoff = 2.2
+    neigh_inds = tree.query_ball_point(atom_pos, r=bond_cutoff)
+
+    # Extra features: coordination (1), mean_dist (1), std_dist (1), neighbor_dir_sum (3), 
+    #                 n_c_neighbors (1), n_h_neighbors (1), nearest_dist (1) => 9 dims
+    extra = np.zeros((n_atoms, 2), dtype=float)
+    # Normalization constants
+    coord_scale = 20.0
+    dist_scale = 2.0
+    for i, inds in enumerate(neigh_inds):
+        inds = [j for j in inds if j != i]              # remove self
+        if len(inds) == 0:
+            extra[i, :] = 0.0
+            continue
+        neigh_vecs = atom_pos[inds] - atom_pos[i]       # (k,3)
+        dists = np.linalg.norm(neigh_vecs, axis=1)
+        mean_d = float(dists.mean())
+        std_d = float(dists.std())
+        min_d = float(dists.min())
+        unit = neigh_vecs / (dists[:, None] + 1e-12)
+        dir_sum = unit.sum(axis=0)
+        
+        # Count C and H neighbors
+        neigh_types = atom_type[inds]
+        n_c = int((neigh_types == 1).sum())
+        n_h = int((neigh_types == 0).sum())
+
+        # Normalized features
+        extra[i, 0] = float(len(inds)) / coord_scale
+        extra[i, 1] = mean_d / dist_scale
+        #extra[i, 2] = std_d / dist_scale
+        #extra[i, 3:6] = dir_sum / np.sqrt(len(inds) + 1.0)
+        #extra[i, 6] = float(n_c) / coord_scale          # n_c_neighbors normalized
+        #extra[i, 7] = float(n_h) / coord_scale          # n_h_neighbors normalized
+        #extra[i, 8] = min_d / dist_scale                # nearest neighbor distance normalized
+
+    # Concatenate original one-hot features with extras -> new atom_feat shape (n_atoms, 11)
+    atom_feat = np.hstack([atom_feat, extra])
+
     # Create mask
     mask = np.ones(max_atoms)
     mask[n_atoms:] = 0
-    
+
     # Pad to max_atoms
+    feat_dim = atom_feat.shape[1]
     if n_atoms < max_atoms:
         padded_pos = np.zeros((max_atoms, 3))
-        padded_feat = np.zeros((max_atoms, 2))
+        padded_feat = np.zeros((max_atoms, feat_dim))
         padded_pos[:n_atoms] = atom_pos
         padded_feat[:n_atoms] = atom_feat
     else:
-        # Truncate if more than max_atoms (shouldn't happen with max_atoms=40)
+        # Truncate if more than max_atoms
         padded_pos = atom_pos[:max_atoms]
         padded_feat = atom_feat[:max_atoms]
         mask = np.ones(max_atoms)
-    
+
     return padded_pos, padded_feat, mask
 
 
@@ -319,22 +366,35 @@ def evaluate(model, molecule_data, device):
 
 def main():
     # Configuration
-    MAX_ATOMS = 40
+    MAX_ATOMS = 150
     RBF_CENTERS = 32
-    HIDDEN_SIZE = 128
+    HIDDEN_SIZE = 256
     CUTOFF = 8.0
-    EPOCHS = 2000
+    EPOCHS = 3000
     LEARNING_RATE = 1e-3
     
     # Data paths
-    base_path = "../VTK/Tacne"
+    base_path = "../VTK/VTK_data"
     train_molecules = [
         #('benz.xyz', 'benz_xy.vtk'),
-        ('DBP.xyz', 'DBP_xy.vtk')
+        #('DBP.xyz', 'DBP_xy.vtk')
+#        ('1.xyz', '1_xy.vtk'),
+#        ('2.xyz', '2_xy.vtk'),
+#        ('3.xyz', '3_xy.vtk'),
+#        ('4.xyz', '4_xy.vtk'),
+#        ('5.xyz', '5_xy.vtk'),
+#        ('6.xyz', '6_xy.vtk'),
+#        ('7.xyz', '7_xy.vtk'),
+#        ('8.xyz', '8_xy.vtk'),
+#        ('9.xyz', '9_xy.vtk'),
+        ('10.xyz', '10_xy.vtk'),
+        ('12.xyz', '12_xy.vtk'),
+#        ('14.xyz', '14_xy.vtk')
     ]
     #test_molecule = ('ZnPorf.xyz', 'ZnPorf_xy.vtk')
-    test_molecule = ('benz.xyz', 'benz_xy.vtk')
+    #test_molecule = ('benz.xyz', 'benz_xy.vtk')
     #test_molecule = ('DBP.xyz', 'DBP_xy.vtk')
+    test_molecule = ('14.xyz', '14_xy.vtk')
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -367,7 +427,7 @@ def main():
     # Create model
     model = PaddedAtomQueryFieldNet(
         max_atoms=MAX_ATOMS,
-        atom_feat_dim=2,
+        atom_feat_dim=4,  # 2 (one-hot) + 2 (extra features)
         rbf_centers=RBF_CENTERS,
         hidden=HIDDEN_SIZE,
         cutoff=CUTOFF
